@@ -19,15 +19,15 @@ const (
 
 type msghead struct {
 	Magic int32
-	Type	msgtype
+	Type  msgtype
 }
 
 func Encode(i interface{}) ([]byte, error) {
 	var err error
-        buf := new(bytes.Buffer)
+	buf := new(bytes.Buffer)
 	enc := gob.NewEncoder(buf)
-	h := msghead{Magic:KMagic}
-	
+	h := msghead{Magic: KMagic}
+
 	switch i.(type) {
 	case *RequestVote:
 		h.Type = KRequestVoteTag
@@ -40,20 +40,20 @@ func Encode(i interface{}) ([]byte, error) {
 	default:
 		return nil, errors.New("unknow struct type in Encode!")
 	}
-       	if err = enc.Encode(h); err != nil {
+	if err = enc.Encode(h); err != nil {
 		return nil, err
 	}
-       	if err = enc.Encode(i); err != nil {
+	if err = enc.Encode(i); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil 
+	return buf.Bytes(), nil
 }
 
 func Decode(b []byte) (i interface{}, err error) {
 	buf := bytes.NewBuffer(b)
 	dec := gob.NewDecoder(buf)
 	var h msghead
-	if err:= dec.Decode(&h); err != nil {
+	if err := dec.Decode(&h); err != nil {
 		return nil, err
 	}
 	if h.Magic != KMagic {
@@ -75,4 +75,3 @@ func Decode(b []byte) (i interface{}, err error) {
 	err = dec.Decode(i)
 	return i, err
 }
-
