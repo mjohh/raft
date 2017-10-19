@@ -26,6 +26,7 @@ func TestEncode(t *testing.T) {
 		if err != nil {
 			t.Errorf("Encode fail, err=%s", err.Error())
 		}
+		//t.Log("%v", buf)
 		o2, err := Decode(buf)
 		if err != nil {
 			t.Errorf("Decode fail, err=%s", err.Error())

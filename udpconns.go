@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"net"
 )
 
@@ -25,6 +26,7 @@ type Addr struct {
 }
 
 type UdpConns struct {
+	myId     int
 	addrs    []*Addr
 	listener *net.UDPConn
 	rcvChan  chan Msg
@@ -37,6 +39,10 @@ type UdpConns struct {
 func NewUdpConns(addrs []*Addr, myid int) (*UdpConns, error) {
 	conns := &UdpConns{addrs: addrs, rcvChan: make(chan Msg, 10)} //TODO
 	l := len(addrs)
+	if myid >= l || myid < 0 {
+		return nil, errors.New("illegal myid val!")
+	}
+	conns.myId = myid
 	conns.sndFail = make([]int, l)
 	conns.sndOk = make([]int, l)
 	conns.rcvFail = make([]int, l)
@@ -48,6 +54,10 @@ func NewUdpConns(addrs []*Addr, myid int) (*UdpConns, error) {
 	}
 	conns.listener = listener
 	return conns, nil
+}
+
+func (c *UdpConns) Close() {
+	c.listener.Close()
 }
 
 func (c *UdpConns) Send(dstid int, buf []byte) (n int, err error) {
@@ -67,10 +77,27 @@ func (c *UdpConns) Send(dstid int, buf []byte) (n int, err error) {
 	return
 }
 
+func (c *UdpConns) Broadcast(buf []byte) (n int, err error) {
+	errcnt := 0
+	for i, _ := range c.addrs {
+		if i != c.myId {
+			n, err = c.Send(i, buf)
+			if err != nil {
+				errcnt += 1
+			}
+		}
+	}
+	if errcnt > 0 {
+		return n, fmt.Errorf("fail times is %d", errcnt)
+	}
+	return n, nil
+}
+
 func (c *UdpConns) Run() {
 	for {
 		buf := make([]byte, 512)
 		n, remoteAddr, err := c.listener.ReadFromUDP(buf)
+		//TODO:if listener is closed, need exit the loop ?
 		if err != nil {
 			continue
 		}
