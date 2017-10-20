@@ -157,6 +157,7 @@ func (r *raft) appendEntriesReceiver(p *AppendEntries) (*AppendEntriesResults, e
 		}
 		// TODO: need save lastApplied to file as currentTerm and votedFor ?
 		r.applier.Apply(entries)
+		r.votedFor = p.LeaderId
 		r.lastApplied = r.commitIndex
 	}
 	r.currentTerm = p.Term
@@ -282,9 +283,7 @@ func (r *raft) candidateHandler(evt interface{}) {
 	}
 }
 
-// TODO: 1. accept cmd from client
-//		 2.	update commitIndex(x)
-//       3. apply logs(x)
+// TODO: 1. accept cmd from client and apply it to state machine
 func (r *raft) leaderHandler(evt interface{}) {
 	switch e := evt.(type) {
 	case *RPCEvt:
@@ -292,14 +291,18 @@ func (r *raft) leaderHandler(evt interface{}) {
 		case *AppendEntriesResults:
 			if o.Term > r.currentTerm {
 				r.state = FollowerState
+				r.votedFor = e.srcId
+				r.currentTerm = o.Term
 				r.cleanVoteGranteds()
 				r.cleanIndexAryOnLeader()
 				r.resetElectionTimeout()
 				r.resetHeatbeatTimeout()
 				r.saveStates()
-			} else if !o.Success {
+			} else if !o.Success { //o.Term==r.currentTerm
 				if e.srcId > -1 && e.srcId < r.nodes {
-					r.nextIndex[e.srcId] -= 1
+					if o.Term == r.currentTerm {
+						r.nextIndex[e.srcId] -= 1
+					}
 				}
 				// retry
 				r.sndAppendEntries()
@@ -320,6 +323,7 @@ func (r *raft) leaderHandler(evt interface{}) {
 			}
 		case *AppendEntries:
 			if o.Term > r.currentTerm {
+				// TODO
 				r.state = FollowerState
 				r.cleanVoteGranteds()
 				r.cleanIndexAryOnLeader()
@@ -327,6 +331,16 @@ func (r *raft) leaderHandler(evt interface{}) {
 				r.resetHeatbeatTimeout()
 				r.saveStates()
 				r.appendEntries(o)
+			}
+		case *RequestVote:
+			if o.Term > r.currentTerm {
+				r.state = FollowerState
+				r.cleanVoteGranteds()
+				r.cleanIndexAryOnLeader()
+				r.resetElectionTimeout()
+				r.resetHeatbeatTimeout()
+				r.saveStates()
+				r.votefor(o)
 			}
 		default:
 		}
@@ -584,4 +598,14 @@ func (r *raft) apply() error {
 		r.lastApplied = r.commitIndex
 	}
 	return nil
+}
+
+// TODO err handling
+func (r *raft) leaderAppendLogs(entries []LogEntry) {
+	lastIndex, _ := r.log.LastIndex()
+	r.log.Write(lastIndex+1, entries)
+	entries2, _ := r.log.Read(r.lastApplied+1, lastIndex+len(entries)+1)
+	r.applier.Apply(entries2)
+	r.lastApplied = lastIndex + len(entries)
+	//TODO reply to clnt
 }

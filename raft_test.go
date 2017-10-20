@@ -557,13 +557,285 @@ func TestElectionTimeout(t *testing.T) {
 		R.followerHandler(BaseTimeoutEvt(1))
 		time += KBaseTimeout
 	}
-	if !(R.electionTimeoutCnt == 0 && R.state == CandidateState) {
+	if !(R.electionTimeoutCnt == 0 && R.state == CandidateState && R.votedFor == R.myId) {
 		t.Errorf("unexpected election timeout state!")
-		t.Logf("R.electionTimeoutCnt=%d, R.state=%v", R.electionTimeoutCnt, R.state)
+		t.Logf("R.electionTimeoutCnt=%d, R.state=%v, R.votedFor=%d, R.electionTimeoutRandom=%d", R.electionTimeoutCnt, R.state, R.votedFor, R.electionTimeoutRandom)
+		t.Logf("time=%d, n=%d", time, n)
 	}
+	R.conns.Close()
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// 1) accept RequestVoteResults msg
+// if get majority granted, convert to leader(init nextIndex[] and matchIndex[])
+// 2)if AppendEntries RPC received from new leader:convert to follower(clean nextIndex[] and matchIndex[], clean voteGranted[])
+// 3)if election timeout:start new election (term++)
+type candidateHandlerExpect struct {
+	currentTerm  int
+	state        State
+	voteGranteds []bool
+}
+
 type candidateHandlerTest struct {
-	a int
+	evt    interface{} //input
+	expect candidateHandlerExpect
+}
+
+func checkCandidateHandlerResults(t *testing.T, r *raft, expect *candidateHandlerExpect, index int) {
+	if !((expect.currentTerm == dontCare || r.currentTerm == expect.currentTerm) &&
+		(expect.state == dontCare || r.state == expect.state) &&
+		reflect.DeepEqual(expect.voteGranteds, r.voteGranteds)) {
+		t.Errorf("[%d]unexpected candidate handler result!", index)
+		t.Logf("currentTerm,state,voteGranteds:\n")
+		t.Logf("result=%d,%v,%v\n", r.currentTerm, r.state, r.voteGranteds)
+		t.Logf("expect=%d,%v,%v\n", expect.currentTerm, expect.state, expect.voteGranteds)
+	}
+}
+
+var testTbl4 = []candidateHandlerTest{
+	{
+		evt: &RPCEvt{
+			o: &RequestVoteResults{
+				Term:        0,
+				VoteGranted: true,
+			},
+			srcId: 1, //myId is 0
+		},
+		expect: candidateHandlerExpect{
+			currentTerm:  0,           //in reality, candidate's term >=1
+			state:        LeaderState, //get majority 2/3
+			voteGranteds: []bool{false, true, false},
+		},
+	},
+	{
+		evt: &RPCEvt{
+			o: &RequestVoteResults{
+				Term:        0,
+				VoteGranted: true,
+			},
+			srcId: 2, //myId is 0
+		},
+		expect: candidateHandlerExpect{
+			currentTerm:  0,           //in reality, candidate's term >=1
+			state:        LeaderState, //get majority
+			voteGranteds: []bool{false, true, true},
+		},
+	},
+	{
+		evt: &RPCEvt{
+			o: &RequestVoteResults{
+				Term:        1,     // >currentTerm but dont affect candidate state
+				VoteGranted: false, //
+			},
+			srcId: 3, //myId is 0, illegal srcId
+		},
+		expect: candidateHandlerExpect{
+			currentTerm:  0, //in reality, candidate's term >=1
+			state:        LeaderState,
+			voteGranteds: []bool{false, true, true},
+		},
+	},
+	{
+		evt: &RPCEvt{
+			o: &AppendEntries{
+				Term:         1, //>currentTerm
+				LeaderId:     2, //==votedFor
+				PrevLogIndex: 0,
+				PrevLogTerm:  0,
+				Entries:      []LogEntry{{Command: []byte("set 1"), Term: 1}},
+				LeaderCommit: 1,
+			}, //
+			srcId: 2,
+		},
+		expect: candidateHandlerExpect{
+			currentTerm:  1, //convert to follower
+			state:        FollowerState,
+			voteGranteds: []bool{false, false, false}, //clean
+		},
+	},
+}
+
+func TestCandidateHandler(t *testing.T) {
+	R := initRaft(t)
+	for i, v := range testTbl4 {
+		R.candidateHandler(v.evt)
+		checkCandidateHandlerResults(t, R, &v.expect, i)
+	}
+	R.conns.Close()
+}
+
+func TestCandidateElectionTimeout(t *testing.T) {
+	R := initRaft(t)
+	term := R.currentTerm
+	time := 0
+	n := R.electionTimeoutRandom
+	for time < n {
+		R.candidateHandler(BaseTimeoutEvt(1))
+		time += KBaseTimeout
+	}
+	if !(R.electionTimeoutCnt == 0 && R.state == CandidateState && R.votedFor == R.myId && term+1 == R.currentTerm) {
+		t.Errorf("unexpected election timeout state!")
+		t.Logf("R.electionTimeoutCnt=%d, R.state=%v, R.votedFor=%d, R.electionTimeoutRandom=%d", R.electionTimeoutCnt, R.state, R.votedFor, R.electionTimeoutRandom)
+	}
+	R.conns.Close()
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//1)send init empty AppendEntries
+//2)broadcast new logs (check nextIndex[] and matchIndex[] before updated)
+//3)recv appendentriesresults
+//   *if success  update nextIndex[] and matchIndex[]
+//   *if false for log inconsistency decr nextIndex[]
+//	 *if false for higher term convert to follower
+//4)check if there exists an N such that N > commitIndex, a majority
+//  of matchIndex[i]>=N, and log[N].term ==currentTerm set commitIndex=N
+type leaderHandlerTest struct {
+	logFromClnt []LogEntry
+	evt         interface{}
+	expect      leaderHandlerExpect
+}
+
+type leaderHandlerExpect struct {
+	currentTerm int
+	state       State
+	nextIndex   []int
+	matchIndex  []int
+	commitIndex int
+	lastApplied int
+}
+
+func checkLeaderHandlerResults(t *testing.T, r *raft, expect *leaderHandlerExpect, index int) {
+	if r.currentTerm != expect.currentTerm ||
+		r.state != expect.state ||
+		!reflect.DeepEqual(r.nextIndex, expect.nextIndex) ||
+		!reflect.DeepEqual(r.matchIndex, expect.matchIndex) ||
+		r.commitIndex != expect.commitIndex ||
+		r.lastApplied != expect.lastApplied {
+		t.Errorf("[%d]unexpect leader handler result!", index)
+		t.Logf("currentTerm,state,nextIndex,matchIndex,commitIndex,lastApplied:\n")
+		t.Logf("result=%d,%v,%v,%v,%d,%d\n", r.currentTerm, r.state, r.nextIndex, r.matchIndex, r.commitIndex, r.lastApplied)
+		t.Logf("expect=%d,%v,%v,%v,%d,%d\n", expect.currentTerm, expect.state, expect.nextIndex, expect.matchIndex, expect.commitIndex, expect.lastApplied)
+
+	}
+}
+
+var testTbl5 = []leaderHandlerTest{
+	{
+		logFromClnt: nil,
+		evt: &RPCEvt{
+			o: &RequestVoteResults{ //convert to leader state firstly
+				Term:        0,
+				VoteGranted: true,
+			},
+			srcId: 1, //myId is 0
+		},
+		expect: leaderHandlerExpect{
+			// checking leader init state
+			currentTerm: 0,
+			state:       LeaderState,
+			nextIndex:   []int{3, 3, 3},
+			matchIndex:  []int{0, 0, 0},
+			commitIndex: 0,
+			lastApplied: 0,
+		},
+	},
+	{
+		logFromClnt: []LogEntry{{Command: []byte("set 1"), Term: 1}},
+		evt:         nil,
+		expect: leaderHandlerExpect{
+			// checking leader init state
+			currentTerm: 0,
+			state:       LeaderState,
+			nextIndex:   []int{3, 3, 3},
+			matchIndex:  []int{0, 0, 0},
+			commitIndex: 0,
+			lastApplied: 3, //update
+		},
+	},
+	// receive appendentriesresults success, get majority reply, incr nextIndex,matchIndex,commitIndex,lastApplied
+	{
+		logFromClnt: nil,
+		evt: &RPCEvt{
+			o: &AppendEntriesResults{
+				Term:    0,
+				Success: true, //get majority 2/3
+			},
+			srcId: 1, //myId is 0
+		},
+		expect: leaderHandlerExpect{
+			// checking leader init state
+			currentTerm: 0,
+			state:       LeaderState,
+			nextIndex:   []int{3, 4, 3}, //increase
+			matchIndex:  []int{0, 3, 0}, //increase
+			commitIndex: 3,              //update
+			lastApplied: 3,
+		},
+	},
+	// receive ppendentriesresults if false for log inconsistency decr nextIndex[]
+	{
+		logFromClnt: nil,
+		evt: &RPCEvt{
+			o: &AppendEntriesResults{
+				Term:    0,
+				Success: false, //because of log inconsistency
+			},
+			srcId: 2, //update
+		},
+		expect: leaderHandlerExpect{
+			// checking leader init state
+			currentTerm: 0,
+			state:       LeaderState,
+			nextIndex:   []int{3, 4, 2}, //decrease of index 2
+			matchIndex:  []int{0, 3, 0},
+			commitIndex: 3,
+			lastApplied: 3,
+		},
+	},
+	// receive ppendentriesresults if false for higher term convert to follower
+	{
+		logFromClnt: nil,
+		evt: &RPCEvt{
+			o: &AppendEntriesResults{
+				Term:    1, //because of larger term from followers
+				Success: false,
+			},
+			srcId: 2, //update
+		},
+		expect: leaderHandlerExpect{
+			// checking leader init state
+			currentTerm: 1, //update
+			state:       FollowerState,
+			nextIndex:   []int{0, 0, 0}, //clean
+			matchIndex:  []int{0, 0, 0}, //clean
+			commitIndex: 3,
+			lastApplied: 3,
+		},
+	},
+}
+
+func initLog(r *raft, entries []LogEntry) {
+	lastIndex, _ := r.log.LastIndex()
+	r.log.Write(lastIndex+1, entries)
+}
+
+func TestLeaderHandler(t *testing.T) {
+	R := initRaft(t)
+	// init log
+	initLog(R, []LogEntry{{Command: []byte("set 1"), Term: 0}, {Command: []byte("set 2"), Term: 0}})
+	for i, v := range testTbl5 {
+		if i == 0 { // convert to leader state firstly
+			R.candidateHandler(v.evt)
+			checkLeaderHandlerResults(t, R, &v.expect, i)
+		} else {
+			if v.logFromClnt != nil {
+				R.leaderAppendLogs(v.logFromClnt)
+			}
+			if v.evt != nil {
+				R.leaderHandler(v.evt)
+			}
+			checkLeaderHandlerResults(t, R, &v.expect, i)
+		}
+	}
+	R.conns.Close()
 }
